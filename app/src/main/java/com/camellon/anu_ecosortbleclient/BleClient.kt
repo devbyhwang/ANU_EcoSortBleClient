@@ -1,154 +1,234 @@
 package com.camellon.anu_ecosortbleclient
 
+import android.Manifest
 import android.annotation.SuppressLint
-import android.bluetooth.*
-import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanResult
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
+import android.bluetooth.BluetoothGattService
+import android.bluetooth.BluetoothManager
 import android.content.Context
-import android.content.Intent
-import android.os.Handler
-import android.os.Looper
+import android.content.pm.PackageManager
+import android.os.Build
 import android.util.Log
+import androidx.core.content.ContextCompat
 import org.json.JSONObject
 import java.util.UUID
 
-@SuppressLint("MissingPermission") // 권한 체크는 UI 쪽에서 끝났다고 가정
-class BleClient(private val appContext: Context) {
+class BleClient(
+    context: Context,
+    private val notificationHelper: NotificationHelper,
+    private val onReady: (() -> Unit)? = null,
+    private val onDisconnected: (() -> Unit)? = null,
+    private val onFailure: ((String) -> Unit)? = null
+) {
+    private val appContext = context.applicationContext
+    private val bluetoothManager = appContext.getSystemService(BluetoothManager::class.java)
+    private val bluetoothAdapter: BluetoothAdapter? = bluetoothManager?.adapter
+    private var gatt: BluetoothGatt? = null
 
-    private val bluetoothManager = appContext.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-    private val bluetoothAdapter: BluetoothAdapter? = bluetoothManager.adapter
-    private val bleScanner = bluetoothAdapter?.bluetoothLeScanner
-    private var bluetoothGatt: BluetoothGatt? = null
+    private val serviceUuid = UUID.fromString("f82d9a22-3dc9-430e-875d-583c9ced1904")
+    private val notifyUuid = UUID.fromString("2c5bba85-ac1c-46c2-a8d3-db389101a028")
+    private val cccdUuid = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
-    private val handler = Handler(Looper.getMainLooper())
-    private var isScanning = false
+    fun getAdapter(): BluetoothAdapter? = bluetoothAdapter
 
-    // 알림창 이미지를 띄워줄 헬퍼 객체 생성
-    private val notificationHelper = NotificationHelper(appContext)
+    fun isBluetoothReady(): Boolean = bluetoothAdapter?.isEnabled == true
 
-    // ⭐️ 주의: 아래 이름과 UUID는 라즈베리파이 쪽 코드에 설정된 값과 똑같이 맞춰주세요!
-    private val TARGET_DEVICE_NAME = "SmartBin"
-    private val SERVICE_UUID: UUID = UUID.fromString("0000ffe0-0000-1000-8000-00805f9b34fb")
-    private val CHAR_UUID: UUID = UUID.fromString("0000ffe1-0000-1000-8000-00805f9b34fb")
-
-    // 1. 주변의 블루투스 기기를 찾는 스캐너 콜백
-    private val scanCallback = object : ScanCallback() {
-        override fun onScanResult(callbackType: Int, result: ScanResult) {
-            val device = result.device
-            val deviceName = device.name ?: "Unknown"
-
-            // 우리가 찾는 스마트 휴지통을 발견했다면!
-            if (deviceName == TARGET_DEVICE_NAME) {
-                Log.d("BleClient", "타겟 기기 발견! 연결을 시도합니다.")
-                stopScan() // 스캔을 멈추고
-                connectToDevice(device) // 연결 시작
-            }
-        }
+    private fun hasConnectPermission(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true
+        return ContextCompat.checkSelfPermission(
+            appContext,
+            Manifest.permission.BLUETOOTH_CONNECT
+        ) == PackageManager.PERMISSION_GRANTED
     }
 
-    // 블루투스 스캔 시작 함수
-    fun startScan() {
-        if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled) {
-            Log.e("BleClient", "블루투스가 켜져있지 않습니다.")
+    @SuppressLint("MissingPermission")
+    fun connect(device: BluetoothDevice) {
+        if (!hasConnectPermission()) {
+            fail("BLUETOOTH_CONNECT permission missing")
             return
         }
-        if (isScanning) return
 
-        isScanning = true
-        bleScanner?.startScan(scanCallback)
-        Log.d("BleClient", "BLE 스캔 시작됨")
+        close()
 
-        // 배터리를 아끼기 위해 10초 동안 못 찾으면 스캔 강제 종료
-        handler.postDelayed({
-            stopScan()
-        }, 10000)
-    }
+        val callback = object : BluetoothGattCallback() {
+            override fun onConnectionStateChange(
+                gatt: BluetoothGatt,
+                status: Int,
+                newState: Int
+            ) {
+                Log.i("BleClient", "onConnectionStateChange status=$status newState=$newState")
 
-    // 블루투스 스캔 종료 함수
-    fun stopScan() {
-        if (!isScanning) return
-        isScanning = false
-        bleScanner?.stopScan(scanCallback)
-        Log.d("BleClient", "BLE 스캔 종료됨")
-    }
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    failAndClose(gatt, "GATT connection failed. status=$status")
+                    onDisconnected?.invoke()
+                    return
+                }
 
-    // 기기에 연결 요청
-    private fun connectToDevice(device: BluetoothDevice) {
-        bluetoothGatt = device.connectGatt(appContext, false, gattCallback)
-    }
-
-    // 2. 블루투스 통신 상태를 관리하는 메인 콜백
-    private val gattCallback = object : BluetoothGattCallback() {
-
-        // 연결 상태가 바뀌었을 때 (연결됨 / 끊어짐)
-        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
-                Log.d("BleClient", "GATT 서버에 성공적으로 연결되었습니다.")
-                // 연결되면 기기가 제공하는 서비스(UUID) 목록을 탐색합니다.
-                gatt.discoverServices()
-            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                Log.d("BleClient", "GATT 서버와 연결이 끊어졌습니다.")
-                bluetoothGatt?.close()
-                bluetoothGatt = null
-            }
-        }
-
-        // 서비스 탐색이 끝났을 때 (통신할 준비가 되었을 때)
-        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                val service = gatt.getService(SERVICE_UUID)
-                val characteristic = service?.getCharacteristic(CHAR_UUID)
-
-                if (characteristic != null) {
-                    // 라즈베리파이가 보내는 신호를 앱이 실시간으로 엿듣도록(구독) 설정
-                    gatt.setCharacteristicNotification(characteristic, true)
-
-                    val descriptor = characteristic.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
-                    if (descriptor != null) {
-                        descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                        gatt.writeDescriptor(descriptor)
+                when (newState) {
+                    BluetoothGatt.STATE_CONNECTED -> {
+                        Log.i("BleClient", "Connected. Discovering services...")
+                        if (!gatt.discoverServices()) {
+                            failAndClose(gatt, "discoverServices() returned false")
+                        }
                     }
-                    Log.d("BleClient", "실시간 알림(Notification)이 활성화되었습니다.")
+
+                    BluetoothGatt.STATE_DISCONNECTED -> {
+                        Log.w("BleClient", "Disconnected")
+                        closeGatt(gatt)
+                        onDisconnected?.invoke()
+                    }
                 }
+            }
+
+            override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+                Log.i("BleClient", "onServicesDiscovered status=$status")
+
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    failAndClose(gatt, "Service discovery failed. status=$status")
+                    return
+                }
+
+                val service: BluetoothGattService = gatt.getService(serviceUuid) ?: run {
+                    failAndClose(gatt, "Service UUID not found: $serviceUuid")
+                    return
+                }
+
+                val characteristic: BluetoothGattCharacteristic =
+                    service.getCharacteristic(notifyUuid) ?: run {
+                        failAndClose(gatt, "Notify characteristic UUID not found: $notifyUuid")
+                        return
+                    }
+
+                val notifySet = gatt.setCharacteristicNotification(characteristic, true)
+                Log.i("BleClient", "setCharacteristicNotification=$notifySet")
+                if (!notifySet) {
+                    failAndClose(gatt, "setCharacteristicNotification() returned false")
+                    return
+                }
+
+                val descriptor = characteristic.getDescriptor(cccdUuid) ?: run {
+                    failAndClose(gatt, "CCCD descriptor not found")
+                    return
+                }
+
+                descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                val writeRequested = gatt.writeDescriptor(descriptor)
+                Log.i("BleClient", "CCCD write requested=$writeRequested")
+
+                if (!writeRequested) {
+                    failAndClose(gatt, "writeDescriptor() returned false")
+                }
+            }
+
+            override fun onDescriptorWrite(
+                gatt: BluetoothGatt,
+                descriptor: BluetoothGattDescriptor,
+                status: Int
+            ) {
+                Log.i("BleClient", "onDescriptorWrite status=$status uuid=${descriptor.uuid}")
+
+                if (descriptor.uuid == cccdUuid && status == BluetoothGatt.GATT_SUCCESS) {
+                    Log.i("BleClient", "BLE notify subscription ready")
+                    onReady?.invoke()
+                } else {
+                    failAndClose(gatt, "CCCD write failed. status=$status")
+                }
+            }
+
+            override fun onCharacteristicChanged(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic
+            ) {
+                if (characteristic.uuid != notifyUuid) return
+                val raw = characteristic.value?.toString(Charsets.UTF_8) ?: return
+                handlePayload(raw)
+            }
+
+            override fun onCharacteristicChanged(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                value: ByteArray
+            ) {
+                if (characteristic.uuid != notifyUuid) return
+                handlePayload(value.toString(Charsets.UTF_8))
             }
         }
 
-        // ⭐️ [가장 핵심] 라즈베리파이에서 새로운 데이터를 보내왔을 때 실행되는 곳!
-        override fun onCharacteristicChanged(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic
-        ) {
-            // 받아온 데이터를 글자(String)로 바꿉니다.
-            val raw = characteristic.getStringValue(0)
-            Log.d("BleClient", "수신된 데이터: $raw")
+        gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            device.connectGatt(appContext, false, callback, BluetoothDevice.TRANSPORT_LE)
+        } else {
+            device.connectGatt(appContext, false, callback)
+        }
 
-            runCatching {
-                // 데이터를 JSON 형식으로 쪼개서 읽습니다.
-                val json = JSONObject(raw)
-                val event = json.optString("event", "UNKNOWN")
-                val message = json.optString("message", "No message")
+        Log.i("BleClient", "connectGatt requested to ${device.address}")
+    }
 
-                val title = if (event == "BIN_FULL") "휴지통 가득 참!" else "스마트 휴지통 알림"
+    private fun handlePayload(raw: String) {
+        Log.i("BleClient", "raw notify payload=$raw")
 
-                // 1. 알림창에 이미지와 함께 띄우기 (NotificationHelper 호출)
-                notificationHelper.showAlertSafe(title, message, message)
+        runCatching {
+            val json = JSONObject(raw)
+            val event = json.optString("event", "UNKNOWN")
+            val message = json.optString("message", "No message")
 
-                // 2. 메인 화면의 이미지를 바꾸기 위해 앱 내부 방송(Broadcast) 쏘기
-                val intent = Intent("com.camellon.ACTION_TRASH_SORTED").apply {
-                    putExtra("category", message) // "Plastic", "Can" 등을 실어 보냄
-                    setPackage(appContext.packageName)
-                }
-                appContext.sendBroadcast(intent)
-
-            }.onFailure {
-                Log.e("BleClient", "JSON 파싱 에러 발생", it)
-                notificationHelper.showAlertSafe("알림", raw)
+            val title = when (event) {
+                "BIN_FULL" -> "분류함 가득 참"
+                "OUTPUT_EXCEPTION" -> "출력 장치 예외"
+                else -> "EcoSort 알림"
             }
+
+            notificationHelper.showAlertSafe(title, message)
+            Log.i("BleClient", "Notification shown. event=$event")
+        }.onFailure {
+            Log.e("BleClient", "Invalid BLE payload: $raw", it)
         }
     }
 
-    // 외부에서 연결을 수동으로 끊고 싶을 때 사용하는 함수
-    fun disconnect() {
-        bluetoothGatt?.disconnect()
+    private fun fail(message: String) {
+        Log.e("BleClient", message)
+        onFailure?.invoke(message)
+    }
+
+    private fun failAndClose(targetGatt: BluetoothGatt, message: String) {
+        fail(message)
+        closeGatt(targetGatt)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun closeGatt(targetGatt: BluetoothGatt) {
+        try {
+            targetGatt.disconnect()
+        } catch (_: Exception) {
+        }
+
+        try {
+            targetGatt.close()
+        } catch (_: Exception) {
+        }
+
+        if (gatt == targetGatt) {
+            gatt = null
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    fun close() {
+        val current = gatt ?: return
+        gatt = null
+
+        try {
+            current.disconnect()
+        } catch (_: Exception) {
+        }
+
+        try {
+            current.close()
+        } catch (_: Exception) {
+        }
     }
 }
