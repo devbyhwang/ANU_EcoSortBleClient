@@ -20,16 +20,23 @@ import java.util.UUID
 
 class BleClient(
     context: Context,
-    private val notificationHelper: NotificationHelper
+    private val notificationHelper: NotificationHelper,
+    private val onReady: (() -> Unit)? = null,
+    private val onDisconnected: (() -> Unit)? = null,
+    private val onFailure: ((String) -> Unit)? = null
 ) {
     private val appContext = context.applicationContext
     private val bluetoothManager = appContext.getSystemService(BluetoothManager::class.java)
-    val bluetoothAdapter: BluetoothAdapter? = bluetoothManager?.adapter
+    private val bluetoothAdapter: BluetoothAdapter? = bluetoothManager?.adapter
     private var gatt: BluetoothGatt? = null
 
     private val serviceUuid = UUID.fromString("f82d9a22-3dc9-430e-875d-583c9ced1904")
     private val notifyUuid = UUID.fromString("2c5bba85-ac1c-46c2-a8d3-db389101a028")
     private val cccdUuid = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+
+    fun getAdapter(): BluetoothAdapter? = bluetoothAdapter
+
+    fun isBluetoothReady(): Boolean = bluetoothAdapter?.isEnabled == true
 
     private fun hasConnectPermission(): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true
@@ -42,60 +49,80 @@ class BleClient(
     @SuppressLint("MissingPermission")
     fun connect(device: BluetoothDevice) {
         if (!hasConnectPermission()) {
-            Log.e("BleClient", "BLUETOOTH_CONNECT permission missing")
+            fail("BLUETOOTH_CONNECT permission missing")
             return
         }
 
         close()
 
         val callback = object : BluetoothGattCallback() {
-            override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            override fun onConnectionStateChange(
+                gatt: BluetoothGatt,
+                status: Int,
+                newState: Int
+            ) {
                 Log.i("BleClient", "onConnectionStateChange status=$status newState=$newState")
+
                 if (status != BluetoothGatt.GATT_SUCCESS) {
-                    Log.e("BleClient", "GATT connect failed, status=$status")
-                    gatt.close()
+                    failAndClose(gatt, "GATT connection failed. status=$status")
+                    onDisconnected?.invoke()
                     return
                 }
 
-                if (newState == BluetoothGatt.STATE_CONNECTED) {
-                    Log.i("BleClient", "Connected. Discovering services...")
-                    gatt.discoverServices()
-                } else if (newState == BluetoothGatt.STATE_DISCONNECTED) {
-                    Log.w("BleClient", "Disconnected")
-                    gatt.close()
+                when (newState) {
+                    BluetoothGatt.STATE_CONNECTED -> {
+                        Log.i("BleClient", "Connected. Discovering services...")
+                        if (!gatt.discoverServices()) {
+                            failAndClose(gatt, "discoverServices() returned false")
+                        }
+                    }
+
+                    BluetoothGatt.STATE_DISCONNECTED -> {
+                        Log.w("BleClient", "Disconnected")
+                        closeGatt(gatt)
+                        onDisconnected?.invoke()
+                    }
                 }
             }
 
             override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
                 Log.i("BleClient", "onServicesDiscovered status=$status")
+
                 if (status != BluetoothGatt.GATT_SUCCESS) {
-                    Log.e("BleClient", "Service discovery failed: $status")
+                    failAndClose(gatt, "Service discovery failed. status=$status")
                     return
                 }
 
                 val service: BluetoothGattService = gatt.getService(serviceUuid) ?: run {
-                    Log.e("BleClient", "Service UUID not found: $serviceUuid")
+                    failAndClose(gatt, "Service UUID not found: $serviceUuid")
                     return
                 }
 
                 val characteristic: BluetoothGattCharacteristic =
                     service.getCharacteristic(notifyUuid) ?: run {
-                        Log.e("BleClient", "Notify characteristic UUID not found: $notifyUuid")
+                        failAndClose(gatt, "Notify characteristic UUID not found: $notifyUuid")
                         return
                     }
 
-                val setOk = gatt.setCharacteristicNotification(characteristic, true)
-                Log.i("BleClient", "setCharacteristicNotification=$setOk")
+                val notifySet = gatt.setCharacteristicNotification(characteristic, true)
+                Log.i("BleClient", "setCharacteristicNotification=$notifySet")
+                if (!notifySet) {
+                    failAndClose(gatt, "setCharacteristicNotification() returned false")
+                    return
+                }
 
-                val descriptor: BluetoothGattDescriptor? = characteristic.getDescriptor(cccdUuid)
-                if (descriptor == null) {
-                    Log.e("BleClient", "CCCD descriptor not found")
+                val descriptor = characteristic.getDescriptor(cccdUuid) ?: run {
+                    failAndClose(gatt, "CCCD descriptor not found")
                     return
                 }
 
                 descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                val writeOk = gatt.writeDescriptor(descriptor)
-                Log.i("BleClient", "CCCD write requested=$writeOk")
+                val writeRequested = gatt.writeDescriptor(descriptor)
+                Log.i("BleClient", "CCCD write requested=$writeRequested")
+
+                if (!writeRequested) {
+                    failAndClose(gatt, "writeDescriptor() returned false")
+                }
             }
 
             override fun onDescriptorWrite(
@@ -104,6 +131,13 @@ class BleClient(
                 status: Int
             ) {
                 Log.i("BleClient", "onDescriptorWrite status=$status uuid=${descriptor.uuid}")
+
+                if (descriptor.uuid == cccdUuid && status == BluetoothGatt.GATT_SUCCESS) {
+                    Log.i("BleClient", "BLE notify subscription ready")
+                    onReady?.invoke()
+                } else {
+                    failAndClose(gatt, "CCCD write failed. status=$status")
+                }
             }
 
             override fun onCharacteristicChanged(
@@ -111,24 +145,17 @@ class BleClient(
                 characteristic: BluetoothGattCharacteristic
             ) {
                 if (characteristic.uuid != notifyUuid) return
-
                 val raw = characteristic.value?.toString(Charsets.UTF_8) ?: return
-                Log.i("BleClient", "raw notify payload=$raw")
+                handlePayload(raw)
+            }
 
-                runCatching {
-                    val json = JSONObject(raw)
-                    val event = json.optString("event", "UNKNOWN")
-                    val message = json.optString("message", "No message")
-                    val title = when (event) {
-                        "BIN_FULL" -> "분류함 가득 참"
-                        "OUTPUT_EXCEPTION" -> "출력 장치 예외"
-                        else -> "EcoSort 알림"
-                    }
-                    notificationHelper.showAlertSafe(title, message)
-                    Log.i("BleClient", "Notification shown. event=$event")
-                }.onFailure {
-                    Log.e("BleClient", "Invalid BLE payload: $raw", it)
-                }
+            override fun onCharacteristicChanged(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                value: ByteArray
+            ) {
+                if (characteristic.uuid != notifyUuid) return
+                handlePayload(value.toString(Charsets.UTF_8))
             }
         }
 
@@ -141,20 +168,67 @@ class BleClient(
         Log.i("BleClient", "connectGatt requested to ${device.address}")
     }
 
-    fun isBluetoothReady(): Boolean = bluetoothAdapter?.isEnabled == true
+    private fun handlePayload(raw: String) {
+        Log.i("BleClient", "raw notify payload=$raw")
 
-    fun getAdapter(): BluetoothAdapter? = bluetoothAdapter
+        runCatching {
+            val json = JSONObject(raw)
+            val event = json.optString("event", "UNKNOWN")
+            val message = json.optString("message", "No message")
+
+            val title = when (event) {
+                "BIN_FULL" -> "분류함 가득 참"
+                "OUTPUT_EXCEPTION" -> "출력 장치 예외"
+                else -> "EcoSort 알림"
+            }
+
+            notificationHelper.showAlertSafe(title, message)
+            Log.i("BleClient", "Notification shown. event=$event")
+        }.onFailure {
+            Log.e("BleClient", "Invalid BLE payload: $raw", it)
+        }
+    }
+
+    private fun fail(message: String) {
+        Log.e("BleClient", message)
+        onFailure?.invoke(message)
+    }
+
+    private fun failAndClose(targetGatt: BluetoothGatt, message: String) {
+        fail(message)
+        closeGatt(targetGatt)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun closeGatt(targetGatt: BluetoothGatt) {
+        try {
+            targetGatt.disconnect()
+        } catch (_: Exception) {
+        }
+
+        try {
+            targetGatt.close()
+        } catch (_: Exception) {
+        }
+
+        if (gatt == targetGatt) {
+            gatt = null
+        }
+    }
 
     @SuppressLint("MissingPermission")
     fun close() {
-        try {
-            gatt?.disconnect()
-        } catch (_: Exception) {
-        }
-        try {
-            gatt?.close()
-        } catch (_: Exception) {
-        }
+        val current = gatt ?: return
         gatt = null
+
+        try {
+            current.disconnect()
+        } catch (_: Exception) {
+        }
+
+        try {
+            current.close()
+        } catch (_: Exception) {
+        }
     }
 }
