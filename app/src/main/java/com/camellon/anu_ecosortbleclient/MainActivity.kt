@@ -9,6 +9,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -38,8 +39,11 @@ class MainActivity : ComponentActivity() {
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { result ->
-        val granted = result.values.all { it }
-        if (granted) {
+        val bluetoothGranted = requiredBluetoothPermissions().all {
+            result[it] == true || hasPermission(it)
+        }
+
+        if (bluetoothGranted) {
             Toast.makeText(this, "권한 허용됨", Toast.LENGTH_SHORT).show()
             if (pendingConnectAfterPermission) {
                 pendingConnectAfterPermission = false
@@ -53,7 +57,7 @@ class MainActivity : ComponentActivity() {
 
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
-            val name = result.device.name ?: result.scanRecord?.deviceName
+            val name = getScanResultName(result)
             if (name == "RaspberryPi_BLE") {
                 stopScan()
 
@@ -104,7 +108,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun requiredPermissions(): Array<String> {
+    private fun requiredBluetoothPermissions(): Array<String> {
         val permissions = mutableListOf<String>()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -114,26 +118,34 @@ class MainActivity : ComponentActivity() {
             permissions += Manifest.permission.ACCESS_FINE_LOCATION
         }
 
+        return permissions.toTypedArray()
+    }
+
+    private fun permissionsToRequest(): Array<String> {
+        val permissions = requiredBluetoothPermissions().toMutableList()
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             permissions += Manifest.permission.POST_NOTIFICATIONS
         }
 
-        return permissions.toTypedArray()
+        return permissions.distinct().filterNot(::hasPermission).toTypedArray()
     }
 
-    private fun hasAllPermissions(): Boolean {
-        return requiredPermissions().all {
-            ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
-        }
+    private fun hasPermission(permission: String): Boolean {
+        return ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun hasBluetoothPermissions(): Boolean {
+        return requiredBluetoothPermissions().all(::hasPermission)
     }
 
     private fun requestPermissionsThenConnect() {
         pendingConnectAfterPermission = true
-        permissionLauncher.launch(requiredPermissions())
+        permissionLauncher.launch(permissionsToRequest())
     }
 
     private fun startConnection() {
-        if (!hasAllPermissions()) {
+        if (!hasBluetoothPermissions()) {
             requestPermissionsThenConnect()
             return
         }
@@ -185,6 +197,18 @@ class MainActivity : ComponentActivity() {
         try {
             bleClient.getAdapter()?.bluetoothLeScanner?.stopScan(scanCallback)
         } catch (_: SecurityException) {
+        }
+    }
+
+    private fun getScanResultName(result: ScanResult): String? {
+        val advertisedName = result.scanRecord?.deviceName
+        if (!advertisedName.isNullOrBlank()) return advertisedName
+
+        return try {
+            result.device.name
+        } catch (e: SecurityException) {
+            Log.w("MainActivity", "Cannot read Bluetooth device name without permission", e)
+            null
         }
     }
 
