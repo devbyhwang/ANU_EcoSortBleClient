@@ -19,15 +19,15 @@ class BleClient(private val appContext: Context) {
     private val bluetoothAdapter: BluetoothAdapter? = bluetoothManager.adapter
     private val bleScanner = bluetoothAdapter?.bluetoothLeScanner
     private var bluetoothGatt: BluetoothGatt? = null
-    
+
     private val handler = Handler(Looper.getMainLooper())
     private var isScanning = false
-    
+
     // 알림창 이미지를 띄워줄 헬퍼 객체 생성
     private val notificationHelper = NotificationHelper(appContext)
 
     // ⭐️ 주의: 아래 이름과 UUID는 라즈베리파이 쪽 코드에 설정된 값과 똑같이 맞춰주세요!
-    private val TARGET_DEVICE_NAME = "SmartBin" 
+    private val TARGET_DEVICE_NAME = "SmartBin"
     private val SERVICE_UUID: UUID = UUID.fromString("0000ffe0-0000-1000-8000-00805f9b34fb")
     private val CHAR_UUID: UUID = UUID.fromString("0000ffe1-0000-1000-8000-00805f9b34fb")
 
@@ -36,7 +36,7 @@ class BleClient(private val appContext: Context) {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val device = result.device
             val deviceName = device.name ?: "Unknown"
-            
+
             // 우리가 찾는 스마트 휴지통을 발견했다면!
             if (deviceName == TARGET_DEVICE_NAME) {
                 Log.d("BleClient", "타겟 기기 발견! 연결을 시도합니다.")
@@ -61,7 +61,7 @@ class BleClient(private val appContext: Context) {
         // 배터리를 아끼기 위해 10초 동안 못 찾으면 스캔 강제 종료
         handler.postDelayed({
             stopScan()
-        }, 10000) 
+        }, 10000)
     }
 
     // 블루투스 스캔 종료 함수
@@ -79,7 +79,7 @@ class BleClient(private val appContext: Context) {
 
     // 2. 블루투스 통신 상태를 관리하는 메인 콜백
     private val gattCallback = object : BluetoothGattCallback() {
-        
+
         // 연결 상태가 바뀌었을 때 (연결됨 / 끊어짐)
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
@@ -98,11 +98,11 @@ class BleClient(private val appContext: Context) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 val service = gatt.getService(SERVICE_UUID)
                 val characteristic = service?.getCharacteristic(CHAR_UUID)
-                
+
                 if (characteristic != null) {
                     // 라즈베리파이가 보내는 신호를 앱이 실시간으로 엿듣도록(구독) 설정
                     gatt.setCharacteristicNotification(characteristic, true)
-                    
+
                     val descriptor = characteristic.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
                     if (descriptor != null) {
                         descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
