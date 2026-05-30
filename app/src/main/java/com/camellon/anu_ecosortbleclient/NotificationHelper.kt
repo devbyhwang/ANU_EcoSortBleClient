@@ -12,17 +12,20 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 
 class NotificationHelper(private val context: Context) {
-    private val channelId = "smart_bin_channel"
     private val notificationManager = NotificationManagerCompat.from(context)
 
     init {
         createNotificationChannel()
     }
 
+    companion object {
+        const val CHANNEL_ID = "smart_bin_channel"
+    }
+
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
-                channelId,
+                CHANNEL_ID,
                 "Smart Bin Notifications",
                 NotificationManager.IMPORTANCE_HIGH
             ).apply {
@@ -46,11 +49,11 @@ class NotificationHelper(private val context: Context) {
             "Can" -> R.drawable.can
             "Glass" -> R.drawable.glass
             "Paper", "Unknown" -> R.drawable.paper
-            else -> R.drawable.standby
+            else -> R.drawable.paper
         }
         val bitmap = BitmapFactory.decodeResource(context.resources, imageResId)
 
-        val notification = NotificationCompat.Builder(context, channelId)
+        val notification = NotificationCompat.Builder(context, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_notify_more) // 기본 제공 아이콘 사용
             .setContentTitle(title)
             .setContentText(message)
