@@ -1,106 +1,117 @@
 package com.camellon.anu_ecosortbleclient
 
 import android.Manifest
-import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanResult
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.widget.Toast
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.height
-import androidx.compose.material3.Button
+import androidx.activity.compose.setContent
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.layout.*
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 
 class MainActivity : ComponentActivity() {
-    private lateinit var notificationHelper: NotificationHelper
-    private lateinit var bleClient: BleClient
 
-    private val handler = Handler(Looper.getMainLooper())
-    private var pendingConnectAfterPermission = false
-    private var scanning = false
+    // 실시간으로 변하는 상태 변수 (그림과 텍스트)
+    private var currentImageRes by mutableIntStateOf(R.drawable.paper)
+    private var statusText by mutableStateOf("쓰레기를 투입해 주세요")
+    private var receiverRegistered = false
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { result ->
-        val granted = result.values.all { it }
-        if (granted) {
-            Toast.makeText(this, "권한 허용됨", Toast.LENGTH_SHORT).show()
-            if (pendingConnectAfterPermission) {
-                pendingConnectAfterPermission = false
-                startConnection()
-            }
+        if (result.values.all { it }) {
+            startBleService()
         } else {
-            pendingConnectAfterPermission = false
-            Toast.makeText(this, "권한이 필요합니다.", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "BLE 권한이 필요합니다.", Toast.LENGTH_LONG).show()
         }
     }
 
-    private val scanCallback = object : ScanCallback() {
-        override fun onScanResult(callbackType: Int, result: ScanResult) {
-            val name = result.device.name ?: result.scanRecord?.deviceName
-            if (name == "RaspberryPi_BLE") {
-                stopScan()
+    // 라즈베리파이 신호를 엿듣는 수신기
+    private val bleReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == "com.camellon.ACTION_TRASH_SORTED") {
+                val category = intent.getStringExtra("category") ?: "Unknown"
 
-                val address = result.device.address
-                Toast.makeText(
-                    this@MainActivity,
-                    "라즈베리 파이 발견: $address",
-                    Toast.LENGTH_SHORT
-                ).show()
-
-                startBleService(address)
+                // 라디오 방송 내용에 따라 그림과 글씨 즉시 교체
+                when (category) {
+                    "Plastic" -> {
+                        currentImageRes = R.drawable.plastic
+                        statusText = "플라스틱 분류 완료!"
+                    }
+                    "Can" -> {
+                        currentImageRes = R.drawable.can
+                        statusText = "캔 분류 완료!"
+                    }
+                    "Glass" -> {
+                        currentImageRes = R.drawable.glass
+                        statusText = "유리 분류 완료!"
+                    }
+                    "Paper", "Unknown" -> {
+                        currentImageRes = R.drawable.paper
+                        statusText = "종이/일반 쓰레기 분류 완료!"
+                    }
+                }
             }
-        }
-
-        override fun onScanFailed(errorCode: Int) {
-            scanning = false
-            Toast.makeText(
-                this@MainActivity,
-                "BLE 스캔 실패: $errorCode",
-                Toast.LENGTH_LONG
-            ).show()
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        notificationHelper = NotificationHelper(this)
-        notificationHelper.ensureChannel()
-        bleClient = BleClient(this, notificationHelper)
+        // 앱이 켜질 때 수신기(Receiver) 등록
+        val filter = IntentFilter("com.camellon.ACTION_TRASH_SORTED")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(bleReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(bleReceiver, filter)
+        }
+        receiverRegistered = true
 
         setContent {
             MaterialTheme {
-                Surface(modifier = Modifier.fillMaxSize()) {
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background
+                ) {
                     Column(
                         modifier = Modifier.fillMaxSize(),
                         verticalArrangement = Arrangement.Center,
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        Text("EcoSort BLE Client", style = MaterialTheme.typography.headlineMedium)
-                        Spacer(modifier = Modifier.height(20.dp))
-                        Button(onClick = { startConnection() }) {
-                            Text("라즈베리 파이 연결하기")
-                        }
+                        Image(
+                            painter = painterResource(id = currentImageRes),
+                            contentDescription = "분류 결과 이미지",
+                            modifier = Modifier.size(200.dp)
+                        )
+                        Spacer(modifier = Modifier.height(16.dp))
+                        Text(
+                            text = statusText,
+                            style = MaterialTheme.typography.titleLarge
+                        )
                     }
                 }
             }
+        }
+
+        if (hasAllPermissions()) {
+            startBleService()
+        } else {
+            permissionLauncher.launch(requiredPermissions())
         }
     }
 
@@ -127,84 +138,21 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun requestPermissionsThenConnect() {
-        pendingConnectAfterPermission = true
-        permissionLauncher.launch(requiredPermissions())
-    }
-
-    private fun startConnection() {
-        if (!hasAllPermissions()) {
-            requestPermissionsThenConnect()
-            return
-        }
-
-        if (!bleClient.isBluetoothReady()) {
-            Toast.makeText(this, "블루투스를 켜주세요.", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        startScan()
-    }
-
-    private fun startScan() {
-        if (scanning) return
-
-        val scanner = bleClient.getAdapter()?.bluetoothLeScanner
-        if (scanner == null) {
-            Toast.makeText(this, "BLE 스캐너를 사용할 수 없습니다.", Toast.LENGTH_LONG).show()
-            return
-        }
-
-        scanning = true
-        Toast.makeText(this, "라즈베리 파이 검색 중...", Toast.LENGTH_SHORT).show()
-
-        try {
-            scanner.startScan(scanCallback)
-        } catch (e: SecurityException) {
-            scanning = false
-            Toast.makeText(this, "BLE 권한이 없습니다.", Toast.LENGTH_LONG).show()
-            return
-        }
-
-        handler.postDelayed({
-            if (scanning) {
-                stopScan()
-                Toast.makeText(
-                    this,
-                    "RaspberryPi_BLE를 찾지 못했습니다.",
-                    Toast.LENGTH_LONG
-                ).show()
-            }
-        }, 10000L)
-    }
-
-    private fun stopScan() {
-        if (!scanning) return
-        scanning = false
-
-        try {
-            bleClient.getAdapter()?.bluetoothLeScanner?.stopScan(scanCallback)
-        } catch (_: SecurityException) {
-        }
-    }
-
-    private fun startBleService(deviceAddress: String) {
-        val intent = Intent(this, BleService::class.java).apply {
-            putExtra("device_address", deviceAddress)
-        }
-
+    private fun startBleService() {
+        val intent = Intent(this, BleService::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(intent)
         } else {
             startService(intent)
         }
-
-        Toast.makeText(this, "BLE 감시 서비스 시작", Toast.LENGTH_SHORT).show()
     }
 
+    // 앱이 꺼질 때 메모리 누수를 막기 위해 수신기 해제
     override fun onDestroy() {
-        stopScan()
-        handler.removeCallbacksAndMessages(null)
         super.onDestroy()
+        if (receiverRegistered) {
+            unregisterReceiver(bleReceiver)
+            receiverRegistered = false
+        }
     }
 }
