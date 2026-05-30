@@ -11,6 +11,7 @@ import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothGattService
 import android.bluetooth.BluetoothManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.util.Log
@@ -183,6 +184,12 @@ class BleClient(
             }
 
             notificationHelper.showAlertSafe(title, message)
+            appContext.sendBroadcast(
+                Intent(MainActivity.ACTION_TRASH_SORTED).apply {
+                    putExtra(MainActivity.EXTRA_TRASH_CATEGORY, message)
+                    setPackage(appContext.packageName)
+                }
+            )
             Log.i("BleClient", "Notification shown. event=$event")
         }.onFailure {
             Log.e("BleClient", "Invalid BLE payload: $raw", it)
