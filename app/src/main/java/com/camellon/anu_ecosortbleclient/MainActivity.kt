@@ -1,9 +1,13 @@
 package com.camellon.anu_ecosortbleclient
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -13,27 +17,42 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.size
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 
 class MainActivity : ComponentActivity() {
+    private var currentImageRes by mutableIntStateOf(R.drawable.standby) // 대기 상태로 시작
     private lateinit var notificationHelper: NotificationHelper
     private lateinit var bleClient: BleClient
 
     private val handler = Handler(Looper.getMainLooper())
     private var pendingConnectAfterPermission = false
     private var scanning = false
+    private var receiverRegistered = false
+
+    private val trashSortedReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != ACTION_TRASH_SORTED) return
+            currentImageRes = imageResForCategory(intent.getStringExtra(EXTRA_TRASH_CATEGORY))
+        }
+    }
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -51,6 +70,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    @SuppressLint("MissingPermission")
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val name = result.device.name ?: result.scanRecord?.deviceName
@@ -84,6 +104,7 @@ class MainActivity : ComponentActivity() {
         notificationHelper = NotificationHelper(this)
         notificationHelper.ensureChannel()
         bleClient = BleClient(this, notificationHelper)
+        registerTrashSortedReceiver()
 
         setContent {
             MaterialTheme {
@@ -93,6 +114,12 @@ class MainActivity : ComponentActivity() {
                         verticalArrangement = Arrangement.Center,
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
+                        Image(
+                            painter = painterResource(id = currentImageRes),
+                            contentDescription = "분류 결과 이미지",
+                            modifier = Modifier.size(200.dp)
+                        )
+                        Spacer(modifier = Modifier.height(20.dp))
                         Text("EcoSort BLE Client", style = MaterialTheme.typography.headlineMedium)
                         Spacer(modifier = Modifier.height(20.dp))
                         Button(onClick = { startConnection() }) {
@@ -102,6 +129,16 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    private fun registerTrashSortedReceiver() {
+        val filter = IntentFilter(ACTION_TRASH_SORTED)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(trashSortedReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(trashSortedReceiver, filter)
+        }
+        receiverRegistered = true
     }
 
     private fun requiredPermissions(): Array<String> {
@@ -146,6 +183,7 @@ class MainActivity : ComponentActivity() {
         startScan()
     }
 
+    @SuppressLint("MissingPermission")
     private fun startScan() {
         if (scanning) return
 
@@ -178,6 +216,7 @@ class MainActivity : ComponentActivity() {
         }, 10000L)
     }
 
+    @SuppressLint("MissingPermission")
     private fun stopScan() {
         if (!scanning) return
         scanning = false
@@ -205,6 +244,26 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         stopScan()
         handler.removeCallbacksAndMessages(null)
+        if (receiverRegistered) {
+            unregisterReceiver(trashSortedReceiver)
+            receiverRegistered = false
+        }
         super.onDestroy()
+    }
+
+    private fun imageResForCategory(category: String?): Int {
+        val lower = category?.trim()?.lowercase() ?: return R.drawable.paper
+        return when {
+            lower.contains("plastic") || lower.contains("플라스틱") -> R.drawable.plastic
+            lower.contains("can") || lower.contains("캔") -> R.drawable.can
+            lower.contains("glass") || lower.contains("유리") -> R.drawable.glass
+            lower.contains("paper") || lower.contains("종이") -> R.drawable.paper
+            else -> R.drawable.paper // 모르는 글자("Unknown" 등)면 종이로!
+        }
+    }
+
+    companion object {
+        const val ACTION_TRASH_SORTED = "com.camellon.ACTION_TRASH_SORTED"
+        const val EXTRA_TRASH_CATEGORY = "category"
     }
 }
